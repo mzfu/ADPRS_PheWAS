@@ -1,0 +1,455 @@
+---
+title: "PRS_AD"
+author: "Mingzhou_Fu"
+date: "7/14/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load in data
+```{r message=FALSE, warning=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(writexl)
+# devtools::install_github("mzfu/epiflow", upgrade_dependencies = FALSE)
+library(epiflow)
+library(PheWAS)
+library(pROC)
+
+work_data_path = '/Users/Mingzhou/Desktop/WQE/data/'
+output_path = '/Users/Mingzhou/Desktop/WQE/Result/'
+phe_table_extract_date = "2021-07-09"
+
+# Load all files (European ancestry)
+load(file = paste0(work_data_path, 'prs.FULL.rda'))
+load(file = paste0(work_data_path, 'safejoin_icd.rda'))
+demographic = read_csv(file = paste0(work_data_path, "BioBank_Demo.csv"))
+```
+
+## Data preparation
+### Merge DFs together
+```{r}
+phe_table_AD = safejoin_icd %>% dplyr::select(UniqueSampleId, `290.11`)
+ddr_demo_short = 
+    demographic %>% 
+    mutate(Age = round(as.numeric((as.Date(phe_table_extract_date)-as.Date(BirthDate))/365.25))) %>% 
+    dplyr::select(UniqueSampleId, Age, Sex) %>% 
+    distinct()
+prs_atlas_short = prs_atlas_final %>% mutate(UniqueSampleId = as.integer(IID)) %>% 
+    dplyr::select(-c(prs, FID, IID)) %>% distinct()
+prs_merged = ddr_demo_short %>% 
+  inner_join(phe_table_AD, by = c("UniqueSampleId" = "UniqueSampleId")) %>% 
+  inner_join(prs_atlas_short, by = c("UniqueSampleId" = "UniqueSampleId")) %>% 
+  distinct() %>% 
+  mutate(AD = case_when(
+    `290.11` == 0 ~ 0,
+    `290.11` >= 1 ~ 1
+  )) %>% 
+  mutate(AD_cat = case_when(
+    AD == 0 ~ "Normal",
+    AD == 1 ~ "AD",
+    TRUE ~ "NA"
+  )) %>% 
+  mutate(case_control = case_when(
+    AD == 0 & Age >= 65 ~ "Control",
+    AD == 1 ~ "Case",
+    TRUE ~ "Exclude"
+  )) %>% 
+  filter(Sex != "X") %>% 
+  mutate(sex = if_else(Sex == "Male", 0, 1))
+table(prs_merged$AD, useNA = "always")
+```
+
+### EUR ancestry
+```{r}
+# European -- N = 7671
+# Define quartiles using control samples
+control_EUR = prs_merged %>% filter(assigned_anc == "EUR" & case_control == "Control") %>% 
+  mutate(PRS_qt = quantcut(prs_eurnorm, q = 4, na.rm = T))
+table(control_EUR$PRS_qt)
+final_EUR = prs_merged %>% filter(assigned_anc == "EUR" & case_control != "Exclude") %>% 
+  mutate(PRS_qt_low = case_when(
+    prs_eurnorm <= -0.948 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(PRS_qt_high = case_when(
+    prs_eurnorm > 0.802 ~ 1,
+    TRUE ~ 0
+  )) 
+# Plot distribution of AD
+ggplot(final_EUR, aes(prs_eurnorm, color = AD_cat)) + geom_density() + 
+ggtitle('PRS distribution in European ancestry sample (n = 7671) \nAD cases vs. (Non-AD & >=65) controls') + xlab('PRS') + theme(text = element_text(size = 12))
+```
+
+### Other ancestry
+```{r}
+# AFR -- N = 501
+control_AFR = prs_merged %>% filter(assigned_anc == "AFR" & case_control == "Control") %>% 
+  mutate(PRS_qt = quantcut(prs_eurnorm, q = 4, na.rm = T))
+table(control_AFR$PRS_qt)
+final_AFR = prs_merged %>% filter(assigned_anc == "AFR" & case_control != "Exclude") %>% 
+  mutate(PRS_qt_low = case_when(
+    prs_eurnorm <= 1.05 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(PRS_qt_high = case_when(
+    prs_eurnorm > 2.97 ~ 1,
+    TRUE ~ 0
+  )) 
+# AMR -- N = 1049
+control_AMR = prs_merged %>% filter(assigned_anc == "AMR" & case_control == "Control") %>% 
+  mutate(PRS_qt = quantcut(prs_eurnorm, q = 4, na.rm = T))
+table(control_AMR$PRS_qt)
+final_AMR = prs_merged %>% filter(assigned_anc == "AMR" & case_control != "Exclude") %>% 
+  mutate(PRS_qt_low = case_when(
+    prs_eurnorm <= -0.867 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(PRS_qt_high = case_when(
+    prs_eurnorm > 0.898 ~ 1,
+    TRUE ~ 0
+  )) 
+# EAS -- N = 905
+control_EAS = prs_merged %>% filter(assigned_anc == "EAS" & case_control == "Control") %>% 
+  mutate(PRS_qt = quantcut(prs_eurnorm, q = 4, na.rm = T))
+table(control_EAS$PRS_qt)
+final_EAS = prs_merged %>% filter(assigned_anc == "EAS" & case_control != "Exclude") %>% 
+  mutate(PRS_qt_low = case_when(
+    prs_eurnorm <= -0.301 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(PRS_qt_high = case_when(
+    prs_eurnorm > 1.27 ~ 1,
+    TRUE ~ 0
+  )) 
+# SAS -- N = 123
+control_SAS = prs_merged %>% filter(assigned_anc == "SAS" & case_control == "Control") %>% 
+  mutate(PRS_qt = quantcut(prs_eurnorm, q = 4, na.rm = T))
+table(control_SAS$PRS_qt)
+final_SAS = prs_merged %>% filter(assigned_anc == "SAS" & case_control != "Exclude") %>% 
+  mutate(PRS_qt_low = case_when(
+    prs_eurnorm <= -0.69 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(PRS_qt_high = case_when(
+    prs_eurnorm > 0.969 ~ 1,
+    TRUE ~ 0
+  )) 
+save(final_EUR, file = paste0(work_data_path, "final_EUR.rda"))
+```
+
+# Check for associations
+```{r}
+lst_model = c('crude_EUR', 'adj_EUR', 'crude_AFR', 'adj_AFR', 'crude_AMR', 'adj_AMR', 'crude_EAS', 'adj_EAS', 'crude_SAS', 'adj_SAS')
+gene_adj_basic = 'Age + sex + PC1 + PC2 + PC3 + PC4 + PC5'
+```
+
+## Logistic regression
+### Continous PRS
+```{r message=FALSE, warning=FALSE}
+# Crude 
+crude_model = as.formula(paste('AD ~ ', 'prs_eurnorm'))
+crude_EUR = glm(crude_model, data = final_EUR, family = 'binomial')
+crude_AFR = glm(crude_model, data = final_AFR, family = 'binomial')
+crude_AMR = glm(crude_model, data = final_AMR, family = 'binomial')
+crude_EAS = glm(crude_model, data = final_EAS, family = 'binomial')
+crude_SAS = glm(crude_model, data = final_SAS, family = 'binomial')
+# Adding in genetic adjusted variables
+f1 = as.formula(paste('AD ~ prs_eurnorm + ', gene_adj_basic))
+adj_EUR = glm(f1, data = final_EUR, family = 'binomial')
+adj_AFR = glm(f1, data = final_AFR, family = 'binomial')
+adj_AMR = glm(f1, data = final_AMR, family = 'binomial')
+adj_EAS = glm(f1, data = final_EAS, family = 'binomial')
+adj_SAS = glm(f1, data = final_SAS, family = 'binomial')
+AD_prs_cont = make_OR_table(lst_model, 2, 'ad_prs_')
+```
+
+#### AUC calculation
+```{r message=FALSE, warning=FALSE}
+# EUR
+EUR_CI_crude = ci.auc(final_EUR$AD, crude_EUR$fitted.values)
+EUR_crude = c(EUR_CI_crude[2], EUR_CI_crude[1], EUR_CI_crude[3])
+EUR_CI_adj = ci.auc(final_EUR$AD, adj_EUR$fitted.values)
+EUR_adj = c(EUR_CI_adj[2], EUR_CI_adj[1], EUR_CI_adj[3])
+# AFR
+AFR_CI_crude = ci.auc(final_AFR$AD, crude_AFR$fitted.values)
+AFR_crude = c(AFR_CI_crude[2], AFR_CI_crude[1], AFR_CI_crude[3])
+AFR_CI_adj = ci.auc(final_AFR$AD, adj_AFR$fitted.values)
+AFR_adj = c(AFR_CI_adj[2], AFR_CI_adj[1], AFR_CI_adj[3])
+# AMR
+AMR_CI_crude = ci.auc(final_AMR$AD, crude_AMR$fitted.values)
+AMR_crude = c(AMR_CI_crude[2], AMR_CI_crude[1], AMR_CI_crude[3])
+AMR_CI_adj = ci.auc(final_AMR$AD, adj_AMR$fitted.values)
+AMR_adj = c(AMR_CI_adj[2], AMR_CI_adj[1], AMR_CI_adj[3])
+# EAS
+EAS_CI_crude = ci.auc(final_EAS$AD, crude_EAS$fitted.values)
+EAS_crude = c(EAS_CI_crude[2], EAS_CI_crude[1], EAS_CI_crude[3])
+EAS_CI_adj = ci.auc(final_EAS$AD, adj_EAS$fitted.values)
+EAS_adj = c(EAS_CI_adj[2], EAS_CI_adj[1], EAS_CI_adj[3])
+# SAS
+SAS_CI_crude = ci.auc(final_SAS$AD, crude_SAS$fitted.values)
+SAS_crude = c(SAS_CI_crude[2], SAS_CI_crude[1], SAS_CI_crude[3])
+SAS_CI_adj = ci.auc(final_SAS$AD, adj_SAS$fitted.values)
+SAS_adj = c(SAS_CI_adj[2], SAS_CI_adj[1], SAS_CI_adj[3])
+AUC_result = rbind(EUR_crude, EUR_adj, AFR_crude, AFR_adj, AMR_crude, AMR_adj, 
+                   EAS_crude, EAS_adj, SAS_crude, SAS_adj)
+colnames(AUC_result) = c("AUC", "lower", "upper")
+options("digits" = 3)
+AUC_result
+```
+
+#### Calculate R^2
+```{r}
+library(fmsb)
+library(data.table)
+# Calculate the null R2 -- use glm for binary trait 
+# (will also need the fmsb package to calculate the pseudo R2)
+null_adj_basic = 'Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5'
+f0 = as.formula(paste('AD ~ ', null_adj_basic))
+f1 = as.formula(paste('AD ~ prs_eurnorm + ', null_adj_basic))
+# EUR
+null.EUR = glm(f0, data = final_EUR, family = 'binomial') 
+null.r2.EUR = fmsb::NagelkerkeR2(null.EUR)
+auto.EUR = glm(f1, data = final_EUR, family = 'binomial') 
+auto.r2.EUR = fmsb::NagelkerkeR2(auto.EUR)
+increased_r2_EUR = auto.r2.EUR$R2 - null.r2.EUR$R2
+EUR_r2 = c(auto.r2.EUR$N, increased_r2_EUR)
+# AFR
+null.AFR = glm(f0, data = final_AFR, family = 'binomial') 
+null.r2.AFR = fmsb::NagelkerkeR2(null.AFR)
+auto.AFR = glm(f1, data = final_AFR, family = 'binomial') 
+auto.r2.AFR = fmsb::NagelkerkeR2(auto.AFR)
+increased_r2_AFR = auto.r2.AFR$R2 - null.r2.AFR$R2
+AFR_r2 = c(auto.r2.AFR$N, increased_r2_AFR)
+# AMR
+null.AMR = glm(f0, data = final_AMR, family = 'binomial') 
+null.r2.AMR = fmsb::NagelkerkeR2(null.AMR)
+auto.AMR = glm(f1, data = final_AMR, family = 'binomial') 
+auto.r2.AMR = fmsb::NagelkerkeR2(auto.AMR)
+increased_r2_AMR = auto.r2.AMR$R2 - null.r2.AMR$R2
+AMR_r2 = c(auto.r2.AMR$N, increased_r2_AMR)
+# EAS
+null.EAS = glm(f0, data = final_EAS, family = 'binomial') 
+null.r2.EAS = fmsb::NagelkerkeR2(null.EAS)
+auto.EAS = glm(f1, data = final_EAS, family = 'binomial') 
+auto.r2.EAS = fmsb::NagelkerkeR2(auto.EAS)
+increased_r2_EAS = auto.r2.EAS$R2 - null.r2.EAS$R2
+EAS_r2 = c(auto.r2.EAS$N, increased_r2_EAS)
+# SAS
+null.SAS = glm(f0, data = final_SAS, family = 'binomial') 
+null.r2.SAS = fmsb::NagelkerkeR2(null.SAS)
+auto.SAS = glm(f1, data = final_SAS, family = 'binomial') 
+auto.r2.SAS = fmsb::NagelkerkeR2(auto.SAS)
+increased_r2_SAS = auto.r2.SAS$R2 - null.r2.SAS$R2
+SAS_r2 = c(auto.r2.SAS$N, increased_r2_SAS)
+r2_result = rbind(EUR_r2, AFR_r2, AMR_r2, EAS_r2, SAS_r2)
+colnames(r2_result) = c("N", "Increased_R2")
+options("digits" = 4)
+r2_result
+```
+
+### Binary PRS
+#### High vs. Low PRS
+```{r message=FALSE, warning=FALSE}
+final_EUR_binary = final_EUR %>% filter(PRS_qt_low == 1 | PRS_qt_high == 1)
+final_AFR_binary = final_AFR %>% filter(PRS_qt_low == 1 | PRS_qt_high == 1)
+final_AMR_binary = final_AMR %>% filter(PRS_qt_low == 1 | PRS_qt_high == 1)
+final_EAS_binary = final_EAS %>% filter(PRS_qt_low == 1 | PRS_qt_high == 1)
+final_SAS_binary = final_SAS %>% filter(PRS_qt_low == 1 | PRS_qt_high == 1)
+# Crude 
+crude_model = as.formula(paste('AD ~ ', 'PRS_qt_high'))
+crude_EUR = glm(crude_model, data = final_EUR_binary, family = 'binomial')
+crude_AFR = glm(crude_model, data = final_AFR_binary, family = 'binomial')
+crude_AMR = glm(crude_model, data = final_AMR_binary, family = 'binomial')
+crude_EAS = glm(crude_model, data = final_EAS_binary, family = 'binomial')
+crude_SAS = glm(crude_model, data = final_SAS_binary, family = 'binomial')
+# Adding in genetic adjusted variables
+f1 = as.formula(paste('AD ~ PRS_qt_high + ', gene_adj_basic))
+adj_EUR = glm(f1, data = final_EUR_binary, family = 'binomial')
+adj_AFR = glm(f1, data = final_AFR_binary, family = 'binomial')
+adj_AMR = glm(f1, data = final_AMR_binary, family = 'binomial')
+adj_EAS = glm(f1, data = final_EAS_binary, family = 'binomial')
+adj_SAS = glm(f1, data = final_SAS_binary, family = 'binomial')
+AD_prs_bi = make_OR_table(lst_model, 2, 'ad_prs_')
+```
+
+```{r}
+# Output to file
+sheets_OR = list('AD_prs_cont' = AD_prs_cont,
+                 'AD_prs_bi' = AD_prs_bi)
+write_xlsx(sheets_OR, path = paste0(output_path, 'AD_PRS_ancestry.xlsx'))
+```
+
+
+# Supplementary: check GWAS & LDpred2 beta associations
+```{r}
+load(file = paste0(work_data_path, 'atlas.full.auto.rda'))
+load(file = paste0(work_data_path, 'final_beta_auto.rda'))
+cor.test(info_snp$beta, final_beta_auto)
+```
+
+```{r}
+library(DescTools)
+ccc = CCC(info_snp$beta, final_beta_auto, ci = "z-transform", conf.level = 0.95, na.rm = FALSE)
+ccc$rho.c
+```
+```{r}
+plot(info_snp$beta, final_beta_auto)
+```
+
+```{r}
+beta_df = cbind(info_snp$rsid, info_snp$beta, final_beta_auto) %>% as.data.frame()
+colnames(beta_df) = c("rsid", "sumstats", "ldpred2")
+```
+
+## ML with logistic regression
+### EUR
+```{r}
+library(caret)
+set.seed(1347)
+inTrain = createDataPartition(y = final_EUR$AD, p = .70, list = FALSE)
+training = final_EUR[inTrain,]
+testing = final_EUR[-inTrain,]
+EUR.fit = glm(AD ~ prs_eurnorm, data = training, family = binomial)
+EUR.fit = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5, data = training, family = binomial)
+```
+
+```{r}
+threshold = 0.02
+predicted_values = ifelse(predict(EUR.fit, training, type = "response") > threshold, 1, 0)
+actual_values = training$AD
+conf_matrix = table(predicted_values, actual_values)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+predicted_values_test = ifelse(predict(EUR.fit, testing, type = "response") > threshold, 1, 0)
+actual_values_test = testing$AD
+conf_matrix = table(predicted_values_test, actual_values_test)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+```
+
+```{r}
+library(pROC)
+roc_obj <- roc(actual_values_test, predict(EUR.fit, testing, type = "response"))
+auc(roc_obj)
+```
+
+### Other ancestry
+```{r}
+# AFR
+set.seed(1347)
+inTrain = createDataPartition(y = final_AFR$AD, p = .70, list = FALSE)
+training = final_AFR[inTrain,]
+testing = final_AFR[-inTrain,]
+AFR.fit = glm(AD ~ prs_eurnorm, data = training, family = binomial)
+AFR.fit = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5, data = training, family = binomial)
+
+threshold = 0.032
+predicted_values = ifelse(predict(AFR.fit, training, type = "response") > threshold, 1, 0)
+actual_values = training$AD
+conf_matrix = table(predicted_values, actual_values)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+predicted_values_test = ifelse(predict(AFR.fit, testing, type = "response") > threshold, 1, 0)
+actual_values_test = testing$AD
+conf_matrix = table(predicted_values_test, actual_values_test)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+roc_obj <- roc(actual_values_test, predict(AFR.fit, testing, type = "response"))
+auc(roc_obj)
+```
+
+```{r}
+# AMR
+set.seed(1347)
+inTrain = createDataPartition(y = final_AMR$AD, p = .70, list = FALSE)
+training = final_AMR[inTrain,]
+testing = final_AMR[-inTrain,]
+AMR.fit = glm(AD ~ prs_eurnorm, data = training, family = binomial)
+AMR.fit = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5, data = training, family = binomial)
+
+threshold = 0.045
+predicted_values = ifelse(predict(AMR.fit, training, type = "response") > threshold, 1, 0)
+actual_values = training$AD
+conf_matrix = table(predicted_values, actual_values)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+predicted_values_test = ifelse(predict(AMR.fit, testing, type = "response") > threshold, 1, 0)
+actual_values_test = testing$AD
+conf_matrix = table(predicted_values_test, actual_values_test)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+roc_obj <- roc(actual_values_test, predict(AMR.fit, testing, type = "response"))
+auc(roc_obj)
+```
+
+```{r}
+# EAS
+set.seed(1347)
+inTrain = createDataPartition(y = final_EAS$AD, p = .70, list = FALSE)
+training = final_EAS[inTrain,]
+testing = final_EAS[-inTrain,]
+EAS.fit = glm(AD ~ prs_eurnorm, data = training, family = binomial)
+EAS.fit = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5, data = training, family = binomial)
+
+threshold = 0.013
+predicted_values = ifelse(predict(EAS.fit, training, type = "response") > threshold, 1, 0)
+actual_values = training$AD
+conf_matrix = table(predicted_values, actual_values)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+predicted_values_test = ifelse(predict(EAS.fit, testing, type = "response") > threshold, 1, 0)
+actual_values_test = testing$AD
+conf_matrix = table(predicted_values_test, actual_values_test)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+roc_obj <- roc(actual_values_test, predict(EAS.fit, testing, type = "response"))
+auc(roc_obj)
+```
+
+```{r}
+# SAS
+set.seed(1347)
+inTrain = createDataPartition(y = final_SAS$AD, p = .70, list = FALSE)
+training = final_SAS[inTrain,]
+testing = final_SAS[-inTrain,]
+SAS.fit = glm(AD ~ prs_eurnorm, data = training, family = binomial)
+SAS.fit = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5, data = training, family = binomial)
+
+threshold = 0.08
+predicted_values = ifelse(predict(SAS.fit, training, type = "response") > threshold, 1, 0)
+actual_values = training$AD
+conf_matrix = table(predicted_values, actual_values)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+predicted_values_test = ifelse(predict(SAS.fit, testing, type = "response") > threshold, 1, 0)
+actual_values_test = testing$AD
+conf_matrix = table(predicted_values_test, actual_values_test)
+conf_matrix
+sensitivity(conf_matrix)
+specificity(conf_matrix)
+
+roc_obj <- roc(actual_values_test, predict(SAS.fit, testing, type = "response"))
+auc(roc_obj)
+```
+

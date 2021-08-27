@@ -1,0 +1,249 @@
+---
+title: "PheWAS_full"
+author: "Mingzhou_Fu"
+date: "7/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load in data
+```{r message=FALSE, warning=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(writexl)
+library(compareGroups)
+# devtools::install_github("mzfu/epiflow", upgrade_dependencies = FALSE)
+library(epiflow)
+library(PheWAS)
+library(pROC)
+
+work_data_path = '/Users/Mingzhou/Desktop/WQE/data/'
+output_path = '/Users/Mingzhou/Desktop/WQE/Result/'
+phe_table_extract_date = "2021-07-09"
+
+# Load all files (European ancestry)
+load(file = paste0(work_data_path, 'prs.FULL.rda'))
+load(file = paste0(work_data_path, 'safejoin_icd.rda'))
+demographic = read_csv(file = paste0(work_data_path, "BioBank_Demo.csv"))
+```
+
+## Data preparation
+### Merge DFs together
+```{r}
+pheno_merged = prs_atlas_final %>% mutate(UniqueSampleId = as.integer(IID)) %>% 
+  dplyr::select(UniqueSampleId, prs_eurnorm, assigned_anc) %>% distinct() %>% 
+  inner_join(safejoin_icd, by = c("UniqueSampleId" = "UniqueSampleId")) %>% distinct()
+# Also add covariates: Age, Sex, PC1-5
+cov_df = prs_atlas_final %>% mutate(UniqueSampleId = as.integer(IID)) %>% 
+  inner_join(demographic) %>% 
+  mutate(Age = round(as.numeric((as.Date(phe_table_extract_date)-as.Date(BirthDate))/365.25))) %>% 
+  dplyr::select(UniqueSampleId, Age, Sex, PC1, PC2, PC3, PC4, PC5) %>% 
+  distinct()
+# By ancestry
+prs_merged_EUR = pheno_merged %>% filter(assigned_anc == "EUR")
+prs_merged_AFR = pheno_merged %>% filter(assigned_anc == "AFR")
+prs_merged_AMR = pheno_merged %>% filter(assigned_anc == "AMR")
+prs_merged_EAS = pheno_merged %>% filter(assigned_anc == "EAS")
+prs_merged_SAS = pheno_merged %>% filter(assigned_anc == "SAS")
+# Function needed
+scale1 = function(x, na.rm = FALSE) (as.logical(x >= 1))
+```
+
+### Demographic and clinical characteristics
+```{r}
+# Make a table for demographics only, include case+control (exclude <65 non-AD)
+demo_df = prs_atlas_final %>% mutate(UniqueSampleId = as.integer(IID)) %>% 
+  dplyr::select(UniqueSampleId, prs_eurnorm, assigned_anc) %>% distinct() %>% 
+  inner_join(demographic, by = c("UniqueSampleId" = "UniqueSampleId")) %>% 
+  mutate(Age = round(as.numeric((as.Date(phe_table_extract_date)-as.Date(BirthDate))/365.25))) %>% 
+  dplyr::select(UniqueSampleId, Age, Sex, prs_eurnorm, assigned_anc) %>% distinct() %>% filter(Sex != "X") %>% 
+  inner_join(safejoin_icd, by = c("UniqueSampleId" = "UniqueSampleId")) %>% distinct() %>% 
+  mutate(AD = case_when(
+    `290.11` == 0 ~ 0,
+    `290.11` >= 1 ~ 1
+  )) %>% 
+  mutate(AD_cat = case_when(
+    AD == 0 ~ "Normal",
+    AD == 1 ~ "AD"
+  )) %>% 
+  # filter(AD == 1 | Age >= 65 & AD == 0) %>% 
+  dplyr::select(UniqueSampleId, Age, Sex, assigned_anc, AD_cat, prs_eurnorm) 
+# Subset the phecode table to samples in the table above, calculate phecode-related characteristics
+clinical_df = demo_df %>% dplyr::select(UniqueSampleId, assigned_anc) %>% left_join(safejoin_icd) %>% 
+  mutate(unique_diagnosis = dplyr::select(., `008`:`915`) %>% mutate_all(scale1) %>% rowSums(na.rm = T)) %>% 
+  dplyr::select(UniqueSampleId, assigned_anc, unique_diagnosis)
+clinical_df %>% dplyr::group_by(assigned_anc) %>% summarise(med_visit = median(unique_diagnosis))
+# Then calculate the mean/median for encounter facts
+# Read in ATLAS files
+enc_raw = read.csv(file = "~/Downloads/BioBank_enc_0721.csv", header = T)
+encounter_df = demo_df %>% dplyr::select(UniqueSampleId, assigned_anc) %>% 
+  left_join(enc_raw, by = c("UniqueSampleId" = "UniqueSampleId")) %>% 
+  mutate(StartDate = as.Date(StartDate)) %>% 
+  dplyr::select(UniqueSampleId, assigned_anc, DiagnosisCode, StartDate) %>% 
+  filter(StartDate <= as.Date(phe_table_extract_date)) %>% distinct()
+# Map to Phecode, calculate time span and #encounters
+enc_icd10_new = 
+  encounter_df %>% 
+  dplyr::select(UniqueSampleId, DiagnosisCode, StartDate) %>% 
+  rename(code = DiagnosisCode) %>% 
+  mutate(vocabulary_id = "ICD10CM") %>% 
+  dplyr::select(UniqueSampleId, vocabulary_id, code, StartDate) %>% 
+  distinct()
+enc_icd10_new_map = mapCodesToPhecodes(enc_icd10_new) %>% distinct()
+encounter_count = enc_icd10_new_map %>% group_by(UniqueSampleId) %>% 
+  summarise(n_encounter = length(unique(StartDate)), 
+            n_diagnosis = length(unique(phecode)),
+            time_span = round(as.numeric(max(StartDate) - min(StartDate))/365.25, 1))
+
+# Merge the final demo and clinical info together
+merged_demo = demo_df %>% full_join(encounter_count)
+
+table_uni = descrTable(assigned_anc ~ Sex + AD_cat + prs_eurnorm + Age + n_encounter + n_diagnosis + time_span, 
+                       method = c(3, 3, 1, 2, 2, 2, 2), merged_demo, hide.no = "No", show.all = T, 
+                       extra.labels = c("","","",""))
+# createTable(table_uni)
+compareGroups::export2csv(table_uni, file = paste0(output_path, 'demo_ancestry.csv'))
+```
+
+
+## PheWAS analysis
+### Analyses by ancestry
+```{r}
+# EUR sample
+start_time = Sys.time()
+# Subset to cases >= 50, convert to logical 
+pheno_df_pre = prs_merged_EUR %>% select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  select_if(function(col) sum(col, na.rm = T) >= 50) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_EUR$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_EUR %>% select(UniqueSampleId, prs_eurnorm)
+prs_full_EUR = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df) 
+  
+prs_merged_EUR_noAD = prs_merged_EUR %>% filter(`290.11` == 0)
+pheno_df_pre = prs_merged_EUR_noAD %>% select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  select_if(function(col) sum(col, na.rm = T) >= 50) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_EUR_noAD$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_EUR_noAD %>% select(UniqueSampleId, prs_eurnorm)
+prs_full_EUR_ex = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df)
+  
+# Run PheWAS
+result_firth_EUR = phewas_ext(names(pheno_df)[-1], predictors = names(prs_df)[-1], cores = 4,
+                          data = prs_full_EUR_ex, cov = names(cov_df)[-1], additive.genotypes = FALSE, 
+                          MASS.confint.level = TRUE, method = "logistf", min.records = 0)
+end_time = Sys.time()
+end_time - start_time
+result_sig_EUR_filter = result_firth_EUR %>% filter(n_cases >= 50) %>% addPhecodeInfo()
+result_sig_EUR = result_sig_EUR_filter %>%
+  mutate(p_adj_bonf = p.adjust(result_sig_EUR_filter$p, method = "bonferroni"),
+         p_adj_fdr = p.adjust(result_sig_EUR_filter$p, method = "fdr")) %>% 
+  select(phenotype, beta, SE, OR, p, p_adj_bonf, p_adj_fdr, n_total, n_cases, n_controls, description, group)
+```
+
+```{r}
+# AFR
+start_time = Sys.time()
+pheno_df_pre = prs_merged_AFR %>% select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  select_if(function(col) sum(col, na.rm = T) >= 10) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_AFR$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_AFR %>% select(UniqueSampleId, prs_eurnorm)
+prs_full_AFR = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df) 
+# Run PheWAS
+result_firth_AFR = phewas_ext(names(pheno_df)[-1], predictors = names(prs_df)[-1], cores = 4,
+                          data = prs_full_AFR, cov = names(cov_df)[-1], additive.genotypes = FALSE, 
+                          MASS.confint.level = TRUE, method = "logistf", min.records = 0)
+end_time = Sys.time()
+end_time - start_time
+result_sig_AFR_filter = result_firth_AFR %>% filter(n_cases >= 10) %>% addPhecodeInfo()
+result_sig_AFR = result_sig_AFR_filter %>%
+  mutate(p_adj_bonf = p.adjust(result_sig_AFR_filter$p, method = "bonferroni"),
+         p_adj_fdr = p.adjust(result_sig_AFR_filter$p, method = "fdr")) %>% 
+  select(phenotype, beta, SE, OR, p, p_adj_bonf, p_adj_fdr, n_total, n_cases, n_controls, description, group)
+```
+
+```{r}
+# AMR
+start_time = Sys.time()
+pheno_df_pre = prs_merged_AMR %>% select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  select_if(function(col) sum(col, na.rm = T) >= 10) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_AMR$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_AMR %>% select(UniqueSampleId, prs_eurnorm)
+prs_full_AMR = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df) 
+# Run PheWAS
+result_firth_AMR = phewas_ext(names(pheno_df)[-1], predictors = names(prs_df)[-1], cores = 4,
+                          data = prs_full_AMR, cov = names(cov_df)[-1], additive.genotypes = FALSE, 
+                          MASS.confint.level = TRUE, method = "logistf", min.records = 0)
+end_time = Sys.time()
+end_time - start_time
+result_sig_AMR_filter = result_firth_AMR %>% filter(n_cases >= 10) %>% addPhecodeInfo()
+result_sig_AMR = result_sig_AMR_filter %>%
+  mutate(p_adj_bonf = p.adjust(result_sig_AMR_filter$p, method = "bonferroni"),
+         p_adj_fdr = p.adjust(result_sig_AMR_filter$p, method = "fdr")) %>% 
+  select(phenotype, beta, SE, OR, p, p_adj_bonf, p_adj_fdr, n_total, n_cases, n_controls, description, group)
+```
+
+```{r}
+# EAS
+start_time = Sys.time()
+pheno_df_pre = prs_merged_EAS %>% select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  select_if(function(col) sum(col, na.rm = T) >= 10) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_EAS$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_EAS %>% select(UniqueSampleId, prs_eurnorm)
+prs_full_EAS = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df) 
+# Run PheWAS
+result_firth_EAS = phewas_ext(names(pheno_df)[-1], predictors = names(prs_df)[-1], cores = 4,
+                          data = prs_full_EAS, cov = names(cov_df)[-1], additive.genotypes = FALSE, 
+                          MASS.confint.level = TRUE, method = "logistf", min.records = 0)
+end_time = Sys.time()
+end_time - start_time
+result_sig_EAS_filter = result_firth_EAS %>% filter(n_cases >= 10) %>% addPhecodeInfo()
+result_sig_EAS = result_sig_EAS_filter %>%
+  mutate(p_adj_bonf = p.adjust(result_sig_EAS_filter$p, method = "bonferroni"),
+         p_adj_fdr = p.adjust(result_sig_EAS_filter$p, method = "fdr")) %>% 
+  select(phenotype, beta, SE, OR, p, p_adj_bonf, p_adj_fdr, n_total, n_cases, n_controls, description, group)
+```
+
+```{r}
+# SAS
+start_time = Sys.time()
+pheno_df_pre = prs_merged_SAS %>% select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  select_if(function(col) sum(col, na.rm = T) >= 10) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_SAS$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_SAS %>% select(UniqueSampleId, prs_eurnorm)
+prs_full_SAS = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df) 
+# Run PheWAS
+result_firth_SAS = phewas_ext(names(pheno_df)[-1], predictors = names(prs_df)[-1], cores = 4,
+                          data = prs_full_SAS, cov = names(cov_df)[-1], additive.genotypes = FALSE, 
+                          MASS.confint.level = TRUE, method = "logistf", min.records = 0)
+end_time = Sys.time()
+end_time - start_time
+result_sig_SAS_filter = result_firth_SAS %>% filter(n_cases >= 10) %>% addPhecodeInfo()
+result_sig_SAS = result_sig_SAS_filter %>%
+  mutate(p_adj_bonf = p.adjust(result_sig_SAS_filter$p, method = "bonferroni"),
+         p_adj_fdr = p.adjust(result_sig_SAS_filter$p, method = "fdr")) %>% 
+  select(phenotype, beta, SE, OR, p, p_adj_bonf, p_adj_fdr, n_total, n_cases, n_controls, description, group)
+```
+
+```{r}
+# Write outputs
+sheets_PheWAS = list('EUR' = result_sig_EUR, 'AFR' = result_sig_AFR, 'AMR' = result_sig_AMR,
+                     'EAS' = result_sig_EAS, 'SAS' = result_sig_SAS)
+write_xlsx(sheets_PheWAS, path = paste0(output_path, 'PheWAS_ancestry.xlsx'))
+```
+
+### Plot EUR results (Manhattan plot)
+```{r}
+result_sig_EUR_sort = result_sig_EUR %>% arrange(phenotype)
+pdf(paste0(output_path, 'PheWAS_EUR.pdf'), width = 20, height = 10)
+ggplot(result_sig_EUR_sort, aes(x = phenotype, y = -log(p_adj_fdr))) + 
+  geom_point(aes(col = group, size = OR)) + theme_classic() + 
+  theme(axis.text.x = element_blank(), panel.grid.minor = element_line(colour = "grey", linetype = "dashed"), 
+        axis.ticks = element_blank(), legend.text = element_text(size = 13),
+        legend.title = element_text(size = 14, face = "bold")) + 
+  labs(color = "Group", size = "Effect size", x = "ATLAS Phenotypes", y = "log(p-value)") + 
+  geom_text_repel(data = . %>% mutate(label = ifelse(p_adj_fdr <= 0.15, as.character(description), "")), 
+                  aes(label = label), size = 5, box.padding = unit(0.7, "lines")) + 
+  geom_hline(yintercept = -log(0.05), color = "red", size = 1, alpha = 0.5) 
+dev.off()
+```

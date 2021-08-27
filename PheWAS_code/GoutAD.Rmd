@@ -1,0 +1,446 @@
+---
+title: "Gout_AD"
+author: "Mingzhou_Fu"
+date: "7/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part 0: Data preparation
+## Load in data
+```{r message=FALSE, warning=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(writexl)
+library(compareGroups)
+# devtools::install_github("mzfu/epiflow", upgrade_dependencies = FALSE)
+library(epiflow)
+library(PheWAS)
+library(pROC)
+library(lmtest) #coeftest
+library(MatchIt)
+library(sandwich) #vcovClibrary(MatchIt)
+library(gtools)
+library(mgcv)
+
+work_data_path = '/Users/Mingzhou/Desktop/WQE/data/'
+output_path = '/Users/Mingzhou/Desktop/WQE/Result/AD_Gout/'
+phe_table_extract_date = "2021-07-09"
+
+# Load all files (European ancestry)
+load(file = paste0(work_data_path, 'prs.FULL.rda'))
+load(file = paste0(work_data_path, 'safejoin_icd.rda'))
+load(file = paste0(work_data_path, 'merged_demo.rda'))
+clinical_var = merged_demo %>% 
+  dplyr::select(UniqueSampleId, n_encounter, n_diagnosis, time_span, min_enc, max_enc)
+demographic = read_csv(file = paste0(work_data_path, "BioBank_Demo.csv"))
+```
+
+## Merge DFs together
+```{r}
+pheno_merged = prs_atlas_final %>% mutate(UniqueSampleId = as.integer(IID)) %>% 
+  dplyr::select(UniqueSampleId, prs_eurnorm, assigned_anc) %>% distinct() %>% 
+  inner_join(safejoin_icd, by = c("UniqueSampleId" = "UniqueSampleId")) %>% distinct()
+# Also add covariates: Age, Sex, PC1-5
+cov_df = prs_atlas_final %>% mutate(UniqueSampleId = as.integer(IID)) %>% 
+  inner_join(demographic) %>% 
+  mutate(Age = round(as.numeric((as.Date(phe_table_extract_date)-as.Date(BirthDate))/365.25))) %>% 
+  dplyr::select(UniqueSampleId, Age, Sex, PC1, PC2, PC3, PC4, PC5) %>% 
+  left_join(clinical_var) %>% 
+  distinct()
+# By ancestry
+prs_merged_EUR = pheno_merged %>% filter(assigned_anc == "EUR")
+# Function needed
+scale1 = function(x, na.rm = FALSE) (as.logical(x >= 1))
+# Subset to cases >= 50, convert to logical 
+pheno_df_pre = prs_merged_EUR %>% dplyr::select(-c(UniqueSampleId, prs_eurnorm, assigned_anc)) %>% 
+  dplyr::select_if(function(col) sum(col, na.rm = T) >= 50) %>% mutate_all(scale1)
+pheno_df = cbind(prs_merged_EUR$UniqueSampleId, pheno_df_pre) %>% rename(UniqueSampleId = V1)
+prs_df = prs_merged_EUR %>% dplyr::select(UniqueSampleId, prs_eurnorm)
+prs_full_EUR = pheno_df %>% inner_join(cov_df) %>% inner_join(prs_df) 
+```
+
+## Make a dataset for Gout+AD
+```{r}
+goutAD_EUR = prs_full_EUR %>% 
+  mutate(AD = case_when(
+    `290.11` == 0 ~ 0,
+    `290.11` >= 1 ~ 1
+  )) %>% 
+  mutate(gout = case_when(
+    `274.1` == 0 ~ 0,
+    `274.1` >= 1 ~ 1
+  )) %>% 
+  mutate(overweight = case_when(
+    `278` == 0 ~ 0,
+    `278` >= 1 ~ 1
+  )) %>% 
+  mutate(hypertension = case_when(
+    `401.1` == 0 ~ 0,
+    `401.1` >= 1 ~ 1
+  )) %>% 
+  mutate(diabetes = case_when(
+    `250.2` == 0 ~ 0,
+    `250.2` >= 1 ~ 1
+  )) %>% 
+  mutate(stroke = case_when(
+    `433` == 0 ~ 0,
+    `433` >= 1 ~ 1
+  )) %>% 
+  mutate(hyperlipid = case_when(
+    `272.1` == 0 ~ 0,
+    `272.1` >= 1 ~ 1
+  )) %>% 
+  filter(Sex != "X") %>% 
+  mutate(PRS_qt = quantcut(prs_eurnorm, q = 4, na.rm = T)) %>% 
+  mutate(PRS_qt_low = case_when(
+    prs_eurnorm <= -0.896 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(PRS_qt_high = case_when(
+    prs_eurnorm > 0.864 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  mutate(sex = if_else(Sex == "Male", 0, 1)) %>% 
+  dplyr::select(UniqueSampleId, Age, sex, PC1, PC2, PC3, PC4, PC5, prs_eurnorm, PRS_qt_low, PRS_qt_high, AD, gout,
+         overweight, hypertension, diabetes, stroke, hyperlipid, n_encounter, n_diagnosis, time_span, min_enc, max_enc) 
+```
+
+# Part 1: Gout and AD PRS in EUR sample
+## Prepare control and sex-specific datasets
+```{r}
+goutAD_EUR_male = goutAD_EUR %>% filter(sex == 0)
+goutAD_EUR_female = goutAD_EUR %>% filter(sex == 1)
+# Exclusion pheWAS -- exclude AD cases
+goutAD_EUR_control = goutAD_EUR %>% filter(AD == 0)
+```
+
+## Logistic regression continuous
+```{r message=FALSE, warning=FALSE}
+# List models
+lst_model = c('crude_full', 'demo_full', 'crude_control', 'demo_control',
+              'crude_male', 'demo_male', 'crude_female', 'demo_female')
+gene_adj_basic = 'Age + sex + PC1 + PC2 + PC3 + PC4 + PC5'
+# Crude 
+crude_model = as.formula(paste('gout ~ ', 'prs_eurnorm'))
+crude_full = glm(crude_model, data = goutAD_EUR, family = 'binomial')
+crude_control = glm(crude_model, data = goutAD_EUR_control, family = 'binomial')
+crude_male = glm(crude_model, data = goutAD_EUR_male, family = 'binomial')
+crude_female = glm(crude_model, data = goutAD_EUR_female, family = 'binomial')
+# Adding in genetic adjusted variables
+f1 = as.formula(paste('gout ~ prs_eurnorm + ', gene_adj_basic))
+demo_full = glm(f1, data = goutAD_EUR, family = 'binomial')
+demo_control = glm(f1, data = goutAD_EUR_control, family = 'binomial')
+demo_male = glm(f1, data = goutAD_EUR_male, family = 'binomial')
+demo_female = glm(f1, data = goutAD_EUR_female, family = 'binomial')
+# Make OR table
+gout_prs_cont = make_OR_table(lst_model, 2, 'gout_prs_')
+```
+
+## Logistic regression binary
+### PRS_qt_high
+```{r message=FALSE, warning=FALSE}
+# List models
+lst_model = c('crude_full', 'demo_full', 'crude_control', 'demo_control',
+              'crude_male', 'demo_male', 'crude_female', 'demo_female')
+gene_adj_basic = 'Age + sex + PC1 + PC2 + PC3 + PC4 + PC5'
+# Crude 
+crude_model = as.formula(paste('gout ~ ', 'PRS_qt_high'))
+crude_full = glm(crude_model, data = goutAD_EUR, family = 'binomial')
+crude_control = glm(crude_model, data = goutAD_EUR_control, family = 'binomial')
+crude_male = glm(crude_model, data = goutAD_EUR_male, family = 'binomial')
+crude_female = glm(crude_model, data = goutAD_EUR_female, family = 'binomial')
+# Adding in genetic adjusted variables
+f1 = as.formula(paste('gout ~ PRS_qt_high + ', gene_adj_basic))
+demo_full = glm(f1, data = goutAD_EUR, family = 'binomial')
+demo_control = glm(f1, data = goutAD_EUR_control, family = 'binomial')
+demo_male = glm(f1, data = goutAD_EUR_male, family = 'binomial')
+demo_female = glm(f1, data = goutAD_EUR_female, family = 'binomial')
+# Make OR table
+gout_prs_high = make_OR_table(lst_model, 2, 'gout_prs_high_')
+```
+
+### PRS_qt_low
+```{r message=FALSE, warning=FALSE}
+# List models
+lst_model = c('crude_full', 'demo_full', 'crude_control', 'demo_control',
+              'crude_male', 'demo_male', 'crude_female', 'demo_female')
+gene_adj_basic = 'Age + sex + PC1 + PC2 + PC3 + PC4 + PC5'
+# Crude 
+crude_model = as.formula(paste('gout ~ ', 'PRS_qt_low'))
+crude_full = glm(crude_model, data = goutAD_EUR, family = 'binomial')
+crude_control = glm(crude_model, data = goutAD_EUR_control, family = 'binomial')
+crude_male = glm(crude_model, data = goutAD_EUR_male, family = 'binomial')
+crude_female = glm(crude_model, data = goutAD_EUR_female, family = 'binomial')
+# Adding in genetic adjusted variables
+f1 = as.formula(paste('gout ~ PRS_qt_low + ', gene_adj_basic))
+demo_full = glm(f1, data = goutAD_EUR, family = 'binomial')
+demo_control = glm(f1, data = goutAD_EUR_control, family = 'binomial')
+demo_male = glm(f1, data = goutAD_EUR_male, family = 'binomial')
+demo_female = glm(f1, data = goutAD_EUR_female, family = 'binomial')
+# Make OR table
+gout_prs_low = make_OR_table(lst_model, 2, 'gout_prs_low_')
+
+# Combine results
+gout_prs_full = rbind(gout_prs_cont, gout_prs_high, gout_prs_low)
+```
+
+# Part 2. Gout and AD in EUR sample
+## 1) Find covariates
+```{r}
+goutAD_EUR_cat = goutAD_EUR %>% mutate(sex_cat = if_else(sex == 0, "Male", "Female"),
+                                       AD_cat = if_else(AD == 0, "Normal", "AD"),
+                                       gout_cat = if_else(gout == 0, "no_gout", "gout"),
+                                       overweight_cat = if_else(overweight == 0, "No", "Yes"),
+                                       hypertension_cat = if_else(hypertension == 0, "No", "Yes"),
+                                       diabetes_cat = if_else(diabetes == 0, "No", "Yes"),
+                                       stroke_cat = if_else(stroke == 0, "No", "Yes"),
+                                       hyperlipid_cat = if_else(hyperlipid == 0, "No", "Yes"))
+# Build table: 1. AD status
+table1_cog = descrTable(AD_cat ~ gout_cat + Age + sex_cat + n_encounter + n_diagnosis + time_span +
+                          overweight_cat + hypertension_cat + diabetes_cat + stroke_cat + hyperlipid_cat +
+                          prs_eurnorm + PC1 + PC2 + PC3 + PC4 + PC5, goutAD_EUR_cat, hide.no = "No", show.all = T)
+compareGroups::export2csv(table1_cog, file = paste0(output_path, 'AD_bivariate.csv'))
+# Build table: 2. Gout status
+table1_gout = descrTable(gout_cat ~ AD_cat + Age + sex_cat + n_encounter + n_diagnosis + time_span +
+                           overweight_cat + hypertension_cat + diabetes_cat + stroke_cat + hyperlipid_cat +
+                          prs_eurnorm + PC1 + PC2 + PC3 + PC4 + PC5, goutAD_EUR_cat, hide.no = "No", show.all = T)
+compareGroups::export2csv(table1_gout, file = paste0(output_path, 'Gout_bivariate.csv'))
+```
+
+## 2) Logistic regressions
+```{r}
+# Prepare non-NA datasets
+goutAD_EUR_noNA = goutAD_EUR %>% dplyr::select(-overweight) %>% drop_na()
+goutAD_EUR_noNA_male = goutAD_EUR_noNA %>% filter(sex == 0)
+goutAD_EUR_noNA_female = goutAD_EUR_noNA %>% filter(sex == 1)
+# List models
+lst_model = c('crude_full', 'demo_full', 'health_full', 'prs_full',
+              'crude_male', 'demo_male', 'health_male', 'prs_male',
+              'crude_female', 'demo_female', 'health_female', 'prs_female')
+demo_adj = 'Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span'
+health_adj = paste0(demo_adj, ' + hypertension + diabetes + stroke + hyperlipid')
+```
+
+### Full sample
+```{r message=FALSE, warning=FALSE}
+# Crude 
+crude_model = as.formula(paste('AD ~ ', 'gout'))
+crude_full = glm(crude_model, data = goutAD_EUR_noNA, family = 'binomial')
+crude_male = glm(crude_model, data = goutAD_EUR_noNA_male, family = 'binomial')
+crude_female = glm(crude_model, data = goutAD_EUR_noNA_female, family = 'binomial')
+# Adding in genetic adjusted variables
+f1 = as.formula(paste('AD ~ gout + ', demo_adj))
+demo_full = glm(f1, data = goutAD_EUR_noNA, family = 'binomial')
+demo_male = glm(f1, data = goutAD_EUR_noNA_male, family = 'binomial')
+demo_female = glm(f1, data = goutAD_EUR_noNA_female, family = 'binomial')
+# Adding in health adjusted variables
+f2 = as.formula(paste('AD ~ gout + ', health_adj))
+health_full = glm(f2, data = goutAD_EUR_noNA, family = 'binomial')
+health_male = glm(f2, data = goutAD_EUR_noNA_male, family = 'binomial')
+health_female = glm(f2, data = goutAD_EUR_noNA_female, family = 'binomial')
+# Adjusted for PRS low
+f3 = as.formula(paste('AD ~ gout + PRS_qt_low + ', health_adj))
+prs_full = glm(f3, data = goutAD_EUR_noNA, family = 'binomial')
+prs_male = glm(f3, data = goutAD_EUR_noNA_male, family = 'binomial')
+prs_female = glm(f3, data = goutAD_EUR_noNA_female, family = 'binomial')
+# Make OR table
+AD_gout_full = make_OR_table(lst_model, 2, 'AD_gout_')
+```
+
+### Sex-specific differences -- spline
+```{r}
+source(file = "~/Desktop/WQE/code/plotGAM.R")
+goutAD_EUR_cat$sex_factor = as.factor(goutAD_EUR_cat$sex_cat)
+spline_adj1 = gam(gout ~ s(prs_eurnorm) + sex_factor + s(prs_eurnorm, by = sex_factor) + Age + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, data = goutAD_EUR_cat)
+goutAD_spline = plotGAM(spline_adj1, smooth.cov = "prs_eurnorm", groupCovs = "sex_factor") + # plot customization goes here 
+            geom_rug(data = goutAD_EUR[goutAD_EUR$sex == 1, ], aes_string(y = "AD", x = "prs_eurnorm" ), alpha = 0.5, colour = '#F8766D', sides = 'b') +
+            geom_rug(data = goutAD_EUR[goutAD_EUR$sex == 0, ],  aes_string(y = "AD", x = "prs_eurnorm" ), alpha = 0.1, colour = '#00BFC4', sides = 't') +
+            labs(x = "AD PRS",
+                 y = "Predicted gout (Gout = 1 vs. Normal = 0)",
+                 title = "Non-linear association between AD PRS and gout (stratified by sex group)") +
+            coord_cartesian(ylim = c(0, 0.25)) +
+            theme_classic(base_family = 'serif',
+                          base_size = 12)
+ggsave(plot = goutAD_spline, path = output_path, filename = "spline_goutPRS.png", width = 6, height = 4)
+```
+
+## 3) Matching
+```{r}
+# 1:10 NN PS matching w/o replacement
+m.out1 = matchit(gout ~ Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+                 data = goutAD_EUR_noNA, exact = "sex",
+                 method = "nearest", distance = "glm", ratio = 100, replace = T)
+summary(m.out1, un = FALSE)
+```
+
+```{r}
+plot(summary(m.out1))
+```
+
+```{r message=FALSE, warning=FALSE}
+m.EUR = match.data(m.out1, weights = "weights", subclass = "subclass")
+fit0 = glm(AD ~ gout, data = m.EUR, family = 'binomial', weights = weights) 
+fit1 = glm(AD ~ gout + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+           data = m.EUR, family = 'binomial', weights = weights) 
+fit2 = glm(AD ~ gout + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span + 
+             hypertension + diabetes + stroke + hyperlipid, 
+           data = m.EUR, family = 'binomial', weights = weights) 
+gout_AD_match = make_OR_table(c("fit0", "fit1", "fit2"), 2, 'gout_AD_match_')
+```
+
+## 4) Permutation tests
+### Prepare matching dataframe
+```{r}
+# Read in ATLAS files
+enc_raw = read.csv(file = "~/Downloads/BioBank_enc_0721.csv", header = T)
+gout_enc = goutAD_EUR %>% left_join(enc_raw, by = c("UniqueSampleId" = "UniqueSampleId")) %>% 
+  filter((gout == 1 | gout == 0) & StartDate <= as.Date(phe_table_extract_date)) %>% 
+  dplyr::select(UniqueSampleId, Age, sex, PC1, PC2, PC3, PC4, PC5, time_span, min_enc, max_enc,
+                prs_eurnorm, PRS_qt_low, PRS_qt_high, 
+                AD, gout, overweight, hypertension, diabetes, stroke, hyperlipid, DiagnosisCode, StartDate)
+# Map to phecode
+gout_enc_phecode = gout_enc %>% rename(code = DiagnosisCode) %>% mutate(vocabulary_id = "ICD10CM") %>% mapCodesToPhecodes()
+gout_code = "274.1"
+AD_code = "290.11"
+# Define cases -- people with gout ever
+set_gout_time = gout_enc_phecode %>% filter(phecode == gout_code) %>% group_by(UniqueSampleId) %>% 
+  mutate(first_gout = as.Date(min(as.Date(StartDate), na.rm = T))) %>% dplyr::select(UniqueSampleId, first_gout) %>% distinct()
+case_id = set_gout_time$UniqueSampleId
+tomatch_df = gout_enc %>% left_join(set_gout_time) %>% 
+  mutate(follow_up_yrs = case_when(
+    !is.na(first_gout) ~ round(as.numeric(max_enc - as.Date(first_gout))/365.25, 1),
+    !is.na(time_span) ~ time_span
+  )) %>% 
+  mutate(case_ctr = case_when(
+    !is.na(first_gout) ~ 1,
+    gout == 0 ~ 0
+  )) %>% 
+  dplyr::select(UniqueSampleId, Age, sex, time_span, first_gout, follow_up_yrs, case_ctr, AD) %>% distinct()
+tomatch_df_nozero = tomatch_df %>% filter(follow_up_yrs > 0 & !is.na(case_ctr)) %>% filter(!is.na(AD))
+# Matching
+m.out2 = matchit(case_ctr ~ Age + sex + follow_up_yrs, 
+                 data = tomatch_df_nozero, exact = "sex",
+                 method = "nearest", distance = "glm", ratio = 5, replace = F)
+summary(m.out2, un = FALSE)
+m.EUR_goutAD = match.data(m.out2, weights = "weights", subclass = "subclass")
+m.EUR_goutAD_test = m.EUR_goutAD %>% left_join(goutAD_EUR)
+# Make sure AD happen after gout
+set_AD_time = gout_enc_phecode %>% filter(phecode == AD_code) %>% group_by(UniqueSampleId) %>% 
+  mutate(first_AD = as.Date(min(as.Date(StartDate), na.rm = T))) %>% dplyr::select(UniqueSampleId, first_AD) %>% distinct()
+m.EUR_goutAD_setAD = m.EUR_goutAD_test %>% left_join(set_AD_time) %>% 
+  mutate(AD_later = case_when(
+    !is.na(first_AD) & (first_AD > first_gout) ~ 1,
+    AD == 1 ~ 1,
+    AD == 0 ~ 0
+  ))
+```
+
+### Perform permutation tests
+```{r}
+num_iteration = 10000
+RR_array = array()
+count_array = array()
+no_ctr_count = 0
+
+for(n in 1:num_iteration){
+  sampled_df = m.EUR_goutAD_setAD %>% group_by(subclass, gout) %>% sample_n(1)
+  result = sampled_df %>% group_by(gout) %>% summarise(n_AD = sum(AD_later)) %>% as.data.frame()
+  control_num = result %>% filter(gout == 0) %>% dplyr::select(n_AD) %>% as.numeric()
+  case_num = result %>% filter(gout == 1) %>% dplyr::select(n_AD) %>% as.numeric()
+  if (control_num != 0) {
+    RR = case_num/control_num
+  } else {
+    RR = case_num + 1/(control_num + 1)
+    no_ctr_count = no_ctr_count + 1
+  }
+      
+  ctr_over_case = if_else(case_num < control_num, 1, 0)
+  RR_array[n] = RR
+  count_array[n] = ctr_over_case
+  
+  n = n + 1
+}
+
+RR_mean = mean(RR_array)
+p_value = sum(count_array)/num_iteration
+print(paste0('RR: ', RR_mean, ', p-value: ', p_value))
+```
+
+# Output results to file
+```{r}
+sheets_OR = list('gout_prs_full' = gout_prs_full,
+                 'AD_gout_full' = AD_gout_full,
+                 'gout_AD_match' = gout_AD_match
+                 )
+write_xlsx(sheets_OR, path = paste0(output_path, 'AD_Gout_associations.xlsx'))
+```
+
+# 8/19/21 added: one-sample MR
+```{r}
+# Crude
+MR_1 = glm(gout ~ prs_eurnorm, data = goutAD_EUR_noNA, family = 'binomial')
+MR_2 = glm(AD ~ prs_eurnorm, data = goutAD_EUR_noNA, family = 'binomial')
+AD_gout_mr_crude = get_MR_value(MR_1, MR_2, 'crude')
+AD_gout_mr_crude = as.data.frame(AD_gout_mr_crude)
+# Demo adjusted
+MR_1 = glm(gout ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+           data = goutAD_EUR_noNA, family = 'binomial')
+MR_2 = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+           data = goutAD_EUR_noNA, family = 'binomial')
+AD_gout_mr_demo = get_MR_value(MR_1, MR_2, 'demo')
+AD_gout_mr_demo = as.data.frame(AD_gout_mr_demo)
+# Health
+MR_1 = glm(gout ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span + 
+             hypertension + diabetes + stroke + hyperlipid, 
+           data = goutAD_EUR_noNA, family = 'binomial')
+MR_2 = glm(AD ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span + 
+             hypertension + diabetes + stroke + hyperlipid, 
+           data = goutAD_EUR_noNA, family = 'binomial')
+AD_gout_mr_health = get_MR_value(MR_1, MR_2, 'health')
+AD_gout_mr_health = as.data.frame(AD_gout_mr_health)
+mr_df = rbind(AD_gout_mr_crude, AD_gout_mr_demo, AD_gout_mr_health)
+```
+
+```{r}
+# Exclude AD cases
+goutAD_EUR_noNA_noAD = goutAD_EUR_noNA %>% filter(AD == 0)
+
+exclude_AD = glm(gout ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+                 data = goutAD_EUR_noNA_noAD, family = 'binomial')
+summary(exclude_AD)
+lst_model = c('exclude_AD')
+exclude_results = make_OR_table(lst_model, 2, 'AD_gout_')
+```
+
+```{r}
+sheets_OR = list('mr_df' = mr_df)
+write_xlsx(sheets_OR, path = paste0(output_path, 'AD_Gout_MR.xlsx'))
+```
+
+# 8/26 added: probit models
+```{r}
+mod1 = glm(gout ~ prs_eurnorm, data = goutAD_EUR_noNA, family=binomial(link='probit'))
+mod2 = glm(AD ~ mod1$fitted.values, data = goutAD_EUR_noNA, family=binomial(link='probit'))
+summary(mod2)
+```
+
+```{r}
+mod1 = glm(gout ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+           data = goutAD_EUR_noNA, family=binomial(link='probit'))
+mod2 = glm(AD ~ mod1$fitted.values + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span, 
+           data = goutAD_EUR_noNA, family=binomial(link='probit'))
+summary(mod2)
+```
+
+```{r}
+mod1 = glm(gout ~ prs_eurnorm + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span + 
+             hypertension + diabetes + stroke + hyperlipid, data = goutAD_EUR_noNA, family=binomial(link='probit'))
+mod2 = glm(AD ~ mod1$fitted.values + Age + sex + PC1 + PC2 + PC3 + PC4 + PC5 + time_span + 
+             hypertension + diabetes + stroke + hyperlipid, data = goutAD_EUR_noNA, family=binomial(link='probit'))
+summary(mod2)
+```
+
